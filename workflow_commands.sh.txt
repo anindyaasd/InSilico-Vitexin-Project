@@ -1,0 +1,133 @@
+#!/bin/bash
+
+# =================================================================
+# STEP 1: PREPARING THE LIGAND (VITEXIN)
+# =================================================================
+# 1. Convert .mol2 file (from Avogadro/CGenFF) to GROMACS format
+# This uses a specific Python script for CHARMM force field conversion.
+# Input: vitexin.mol2 | Output: vitexin.str (parameters)
+python cgenff_charmm2gmx.py JZ4 vitexin.mol2 vitexin.str charmm36-jul2021.ff
+
+# 2. Convert the resulting .str file into GROMACS topology (.itp) and coordinate (.gro)
+# Note: This is usually done via recentering or editconf if needed.
+gmx editconf -f vitexin_ini.pdb -o vitexin.gro
+
+
+# =================================================================
+# STEP 2: PREPARING THE PROTEIN
+# =================================================================
+# 1. Generate topology for the protein
+# -f: input file (PDB)
+# -o: output coordinate file
+# -water tip3p: Choosing TIP3P water model
+# Selection: Choose CHARMM36 Force Field when prompted
+gmx pdb2gmx -f gyrase_clean.pdb -o gyrase_processed.gro -water tip3p
+
+
+# =================================================================
+# STEP 3: COMPLEX ASSEMBLY (MANUAL & TERMINAL)
+# =================================================================
+# IMPORTANT NOTE:
+# At this stage, I manually copied the coordinate lines from 'vitexin.gro' 
+# and pasted them into 'gyrase_processed.gro' to create 'complex.gro'.
+# I also updated 'topol.top' to include: #include "vitexin.itp"
+
+# 1. Define the Simulation Box
+# -c: Center the molecule in the box
+# -d 1.0: Distance of 1.0 nm from the box edge
+# -bt cubic: Box type cubic
+gmx editconf -f complex.gro -o newbox.gro -c -d 1.0 -bt cubic
+
+# 2. Solvate the System (Add Water)
+# -cp: Configuration of protein (box)
+# -cs: Configuration of solvent (spc216.gro is standard water)
+# -p: Update topology file automatically
+gmx solvate -cp newbox.gro -cs spc216.gro -o solvated.gro -p topol.top
+
+
+# =================================================================
+# STEP 4: ADDING IONS (NEUTRALIZATION)
+# =================================================================
+# 1. Prepare the binary input file (.tpr) for ion generation
+gmx grompp -f ions.mdp -c solvated.gro -p topol.top -o ions.tpr
+
+# 2. Replace water molecules with ions
+# -pname NA -nname CL: Use Sodium and Chloride ions
+# -neutral: Add ions until net charge is 0
+# Selection: Select Group 13 (SOL) to replace water, not protein!
+gmx genion -s ions.tpr -o solvated_ions.gro -p topol.top -pname NA -nname CL -neutral
+
+
+# =================================================================
+# STEP 5: ENERGY MINIMIZATION (EM)
+# =================================================================
+# Aim: To relax the structure and remove steric clashes.
+
+# 1. Assemble binary input for EM
+gmx grompp -f minim.mdp -c solvated_ions.gro -p topol.top -o em.tpr
+
+# 2. Run the minimization
+# -v: Verbose (show progress in terminal)
+gmx mdrun -v -deffnm em
+
+# 3. Analyze Potential Energy (Quality Control)
+# Selection: Potential (10)
+gmx energy -f em.edr -o potential.xvg
+
+
+# =================================================================
+# STEP 6: EQUILIBRATION (Temperature & Pressure)
+# =================================================================
+# Phase 1: NVT (Constant Number, Volume, Temperature)
+# We need to restrain the protein/ligand while heating up the solvent.
+
+# 1. Make Index File (Create a "Protein_Ligand" group)
+# Usually merge Protein and Ligand group in the interactive menu
+gmx make_ndx -f em.gro -o index.ndx
+
+# 2. Run NVT
+gmx grompp -f nvt.mdp -c em.gro -r em.gro -p topol.top -n index.ndx -o nvt.tpr
+gmx mdrun -deffnm nvt
+
+# Phase 2: NPT (Constant Number, Pressure, Temperature)
+# 3. Run NPT
+gmx grompp -f npt.mdp -c nvt.gro -r nvt.gro -t nvt.cpt -p topol.top -n index.ndx -o npt.tpr
+gmx mdrun -deffnm npt
+
+
+# =================================================================
+# STEP 7: ANALYSIS
+# =================================================================
+# 1. Fix Periodic Boundary Conditions (PBC)
+# Usually the protein "jumps" across the box. We need to center it.
+# Selection: Protein (1) to center -> System (0) for output
+gmx trjconv -s md_0_1.tpr -f md_0_1.xtc -o md_noPBC.xtc -pbc mol -center
+
+# 2. RMSD (Root Mean Square Deviation) - Stability check
+# Selection: Backbone (4) -> Backbone (4)
+gmx rms -s md_0_1.tpr -f md_noPBC.xtc -o rmsd.xvg -tu ns
+
+# 3. RMSD of Ligand relative to Protein
+# Selection: Protein (1) -> Ligand (13)
+gmx rms -s md_0_1.tpr -f md_noPBC.xtc -o rmsd_ligand.xvg -tu ns
+
+# 4. RMSF (Fluctuation per Residue) - Flexibility check
+# Selection: C-alpha (3)
+gmx rmsf -s md_0_1.tpr -f md_noPBC.xtc -o rmsf.xvg -res
+
+# 5. Hydrogen Bonds Analysis
+# Selection: Protein (1) and Ligand (13)
+gmx hbond -s md_0_1.tpr -f md_noPBC.xtc -num hydrogen_bonds.xvg
+
+# 6. Interaction Energy (Short Range)
+# Need to extract from energy file
+gmx energy -f md_0_1.edr -o interaction_energy.xvg
+
+
+# =================================================================
+# STEP 9: VISUALIZATION
+# =================================================================
+# Using Xmgrace to plot .xvg files
+xmgrace rmsd.xvg
+xmgrace rmsf.xvg
+xmgrace hydrogen_bonds.xvg
